@@ -109,6 +109,8 @@ func (c DependencyConstraints) andDependent(parent DependencyConstraints) Depend
 	}
 }
 
+// ComponentOwnConstraints specifies constraints defined at the component level.
+// They are not propagated to the dependencies. Is empty in the current version
 type ComponentOwnConstraints struct {
 	// Improvement: add start/close timeouts for own phases
 }

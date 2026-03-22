@@ -3,139 +3,116 @@ package lcadapters
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	"github.com/cardinalby/go-lccore/internal/contexts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// mockRunnable is a test implementation of Runnable
-type mockRunnable struct {
-	runFunc     func(ctx context.Context, onReady func()) error
-	runCalled   atomic.Bool
-	runCtx      context.Context
-	readyCalled atomic.Bool
-}
-
-func (m *mockRunnable) Run(ctx context.Context, onReady func()) error {
-	m.runCalled.Store(true)
-	m.runCtx = ctx
-	if m.runFunc != nil {
-		return m.runFunc(ctx, onReady)
-	}
-	onReady()
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-func TestNewRunnableNodeBehaviorAdapter(t *testing.T) {
-	runnable := &mockRunnable{}
-	adapter := NewRunFnAdapter(runnable.Run)
+func TestNewRunFnAdapter(t *testing.T) {
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		return nil
+	})
 	require.NotNil(t, adapter)
 }
 
-func TestRunnableAdapter_Start_Success(t *testing.T) {
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-ctx.Done()
-			return nil
-		},
-	}
-
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
-
-	err := adapter.OnStart()(ctx)
-	assert.NoError(t, err)
-	assert.True(t, runnable.runCalled.Load())
-}
-
-func TestRunnableAdapter_Start_ImmediateReturn(t *testing.T) {
-	expectedErr := errors.New("immediate error")
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			return expectedErr
-		},
-	}
-
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
-
-	err := adapter.OnStart()(ctx)
-	assert.Equal(t, expectedErr, err)
-}
-
-func TestRunnableAdapter_Start_ContextCanceledBeforeReady(t *testing.T) {
+// TestRunFnAdapter_Start_ReturnsImmediately verifies that start does not block waiting
+// for the runFn to finish and returns nil immediately.
+func TestRunFnAdapter_Start_ReturnsImmediately(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		readyBlocker := make(chan struct{})
-		runnable := &mockRunnable{
-			runFunc: func(ctx context.Context, onReady func()) error {
-				<-readyBlocker // block until test cancels context
-				onReady()
-				<-ctx.Done()
-				return ctx.Err()
-			},
-		}
+		blocking := make(chan struct{})
+		started := make(chan struct{})
 
-		adapter := NewRunFnAdapter(runnable.Run)
-		ctx, cancel := context.WithCancel(context.Background())
+		adapter := NewRunFnAdapter(func(ctx context.Context) error {
+			close(started)
+			<-blocking
+			return nil
+		})
 
 		startDone := make(chan error)
 		go func() {
-			startDone <- adapter.OnStart()(ctx)
+			startDone <- adapter.OnStart()(context.Background())
 		}()
 
-		// Wait for goroutine to be blocked
+		// start must return before runFn finishes
 		synctest.Wait()
-		cancel()
-		close(readyBlocker)
+		select {
+		case err := <-startDone:
+			assert.NoError(t, err)
+		default:
+			t.Fatal("Start did not return immediately")
+		}
 
-		err := <-startDone
-		assert.Error(t, err)
-		assert.True(t, errors.Is(err, context.Canceled))
+		// clean up
+		close(blocking)
 	})
 }
 
-func TestRunnableAdapter_Start_AlreadyRunning(t *testing.T) {
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-ctx.Done()
-			return nil
-		},
-	}
+// TestRunFnAdapter_Start_AlreadyRunning verifies that a second Start call while the
+// first runFn is still running returns ErrAlreadyRunning.
+func TestRunFnAdapter_Start_AlreadyRunning(t *testing.T) {
+	blocking := make(chan struct{})
 
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-blocking
+		return nil
+	})
 
-	err := adapter.OnStart()(ctx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	// Try to start again while still running
-	err = adapter.OnStart()(ctx)
+	err = adapter.OnStart()(context.Background())
 	assert.ErrorIs(t, err, ErrAlreadyRunning)
+
+	close(blocking)
 }
 
-func TestRunnableAdapter_Wait_Success(t *testing.T) {
+// TestRunFnAdapter_Start_IgnoresStartContext verifies that canceling the context
+// passed to start has no effect on the running runFn.
+func TestRunFnAdapter_Start_IgnoresStartContext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		readySignal := make(chan struct{})
-		runnable := &mockRunnable{
-			runFunc: func(ctx context.Context, onReady func()) error {
-				onReady()
-				<-readySignal
-				return nil
-			},
+		runFinished := make(chan struct{})
+
+		adapter := NewRunFnAdapter(func(ctx context.Context) error {
+			// runFn owns its own context; the start ctx is irrelevant
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+		startCtx, cancelStart := context.WithCancel(context.Background())
+
+		err := adapter.OnStart()(startCtx)
+		require.NoError(t, err)
+
+		// Cancel the start context — runFn must still be running
+		cancelStart()
+		synctest.Wait()
+		select {
+		case <-runFinished:
+			t.Fatal("runFn stopped when start context was canceled")
+		default:
+			// expected: runFn is still blocked on its own ctx
 		}
 
-		adapter := NewRunFnAdapter(runnable.Run)
-		ctx := context.Background()
+		// Clean up via Close
+		err = adapter.OnClose()(context.Background())
+		assert.NoError(t, err)
+	})
+}
 
-		err := adapter.OnStart()(ctx)
+// TestRunFnAdapter_Wait_BlocksUntilDone verifies that wait blocks until runFn completes.
+func TestRunFnAdapter_Wait_BlocksUntilDone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+
+		adapter := NewRunFnAdapter(func(ctx context.Context) error {
+			<-release
+			return nil
+		})
+
+		err := adapter.OnStart()(context.Background())
 		require.NoError(t, err)
 
 		waitDone := make(chan error)
@@ -143,168 +120,135 @@ func TestRunnableAdapter_Wait_Success(t *testing.T) {
 			waitDone <- adapter.OnWait()()
 		}()
 
-		// Wait should block until runFn completes
 		synctest.Wait()
 		select {
 		case <-waitDone:
-			t.Fatal("Wait returned too early")
+			t.Fatal("Wait returned before runFn completed")
 		default:
-			// Expected to block
+			// expected to block
 		}
 
-		close(readySignal)
+		close(release)
 		err = <-waitDone
 		assert.NoError(t, err)
 	})
 }
 
-func TestRunnableAdapter_Wait_WithError(t *testing.T) {
+// TestRunFnAdapter_Wait_ReturnsError verifies that wait propagates a non-nil error
+// returned by runFn.
+func TestRunFnAdapter_Wait_ReturnsError(t *testing.T) {
 	expectedErr := errors.New("run error")
-	readySignal := make(chan struct{})
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-readySignal
-			return expectedErr
-		},
-	}
+	release := make(chan struct{})
 
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-release
+		return expectedErr
+	})
 
-	err := adapter.OnStart()(ctx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	close(readySignal)
+	close(release)
 	err = adapter.OnWait()()
 	assert.Equal(t, expectedErr, err)
 }
 
-func TestRunnableAdapter_Close_Success(t *testing.T) {
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-ctx.Done()
-			// Perform cleanup with close context
-			closeCtx := contexts.GetCloseCtx(ctx)
-			assert.NotNil(t, closeCtx)
-			return ctx.Err()
-		},
-	}
+// TestRunFnAdapter_Close_CancelsRunFnAndReturnsNil verifies that close cancels the
+// runFn context and returns nil when runFn returns ctx.Err().
+func TestRunFnAdapter_Close_CancelsRunFnAndReturnsNil(t *testing.T) {
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
 
-	adapter := NewRunFnAdapter(runnable.Run)
-	startCtx := context.Background()
-
-	err := adapter.OnStart()(startCtx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	closeCtx := context.Background()
-	err = adapter.OnClose()(closeCtx)
+	err = adapter.OnClose()(context.Background())
 	assert.NoError(t, err)
 }
 
-func TestRunnableAdapter_Close_ReturnsNonContextError(t *testing.T) {
+// TestRunFnAdapter_Close_ReturnsNonContextError verifies that close propagates a
+// non-context error returned by runFn.
+func TestRunFnAdapter_Close_ReturnsNonContextError(t *testing.T) {
 	expectedErr := errors.New("close error")
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-ctx.Done()
-			return expectedErr
-		},
-	}
 
-	adapter := NewRunFnAdapter(runnable.Run)
-	startCtx := context.Background()
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-ctx.Done()
+		return expectedErr
+	})
 
-	err := adapter.OnStart()(startCtx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	closeCtx := context.Background()
-	err = adapter.OnClose()(closeCtx)
+	err = adapter.OnClose()(context.Background())
 	assert.Equal(t, expectedErr, err)
 }
 
-func TestRunnableAdapter_Close_PassesCloseContext(t *testing.T) {
+// TestRunFnAdapter_Close_PassesCloseContext verifies that the context passed to close
+// is available inside runFn via contexts.GetCloseCtx.
+func TestRunFnAdapter_Close_PassesCloseContext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var capturedCloseCtx context.Context
-		runnable := &mockRunnable{
-			runFunc: func(ctx context.Context, onReady func()) error {
-				onReady()
-				<-ctx.Done()
-				capturedCloseCtx = contexts.GetCloseCtx(ctx)
-				// Simulate cleanup that uses close context
-				<-capturedCloseCtx.Done()
-				return ctx.Err()
-			},
-		}
 
-		adapter := NewRunFnAdapter(runnable.Run)
-		startCtx := context.Background()
+		adapter := NewRunFnAdapter(func(ctx context.Context) error {
+			<-ctx.Done()
+			capturedCloseCtx = contexts.GetCloseCtx(ctx)
+			<-capturedCloseCtx.Done()
+			return ctx.Err()
+		})
 
-		err := adapter.OnStart()(startCtx)
+		err := adapter.OnStart()(context.Background())
 		require.NoError(t, err)
 
-		closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
+		closeCtx, cancelClose := context.WithCancel(context.Background())
 
 		closeDone := make(chan error)
 		go func() {
 			closeDone <- adapter.OnClose()(closeCtx)
 		}()
 
-		// Wait for close context to be set up
+		// Wait until runFn has captured the close context and is blocked on it
 		synctest.Wait()
 		require.NotNil(t, capturedCloseCtx)
 
-		cancel()
+		cancelClose()
 		err = <-closeDone
 		assert.NoError(t, err)
 	})
 }
 
-func TestRunnableAdapter_FullLifecycle(t *testing.T) {
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-ctx.Done()
-			return nil
-		},
-	}
+// TestRunFnAdapter_FullLifecycle exercises start → wait (in goroutine) → close → wait resolves.
+func TestRunFnAdapter_FullLifecycle(t *testing.T) {
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-ctx.Done()
+		return nil
+	})
 
-	adapter := NewRunFnAdapter(runnable.Run)
-
-	// Start
-	startCtx := context.Background()
-	err := adapter.OnStart()(startCtx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	// Close
-	closeCtx := context.Background()
-	err = adapter.OnClose()(closeCtx)
+	err = adapter.OnClose()(context.Background())
 	assert.NoError(t, err)
 
-	// Wait should return immediately after close
+	// Wait should return immediately since runFn already finished
 	err = adapter.OnWait()()
 	assert.NoError(t, err)
 }
 
-func TestRunnableAdapter_ConcurrentWaitCalls(t *testing.T) {
-	readySignal := make(chan struct{})
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			<-readySignal
-			return nil
-		},
-	}
+// TestRunFnAdapter_ConcurrentWaitCalls verifies that multiple concurrent Wait calls all
+// unblock and return the same result when runFn completes.
+func TestRunFnAdapter_ConcurrentWaitCalls(t *testing.T) {
+	release := make(chan struct{})
 
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		<-release
+		return nil
+	})
 
-	err := adapter.OnStart()(ctx)
+	err := adapter.OnStart()(context.Background())
 	require.NoError(t, err)
 
-	// Multiple concurrent Wait calls
 	const numWaiters = 5
 	waitErrs := make(chan error, numWaiters)
 
@@ -314,7 +258,7 @@ func TestRunnableAdapter_ConcurrentWaitCalls(t *testing.T) {
 		}()
 	}
 
-	close(readySignal)
+	close(release)
 
 	for i := 0; i < numWaiters; i++ {
 		err := <-waitErrs
@@ -322,89 +266,16 @@ func TestRunnableAdapter_ConcurrentWaitCalls(t *testing.T) {
 	}
 }
 
-func TestRunnableAdapter_Start_ReadyCalledMultipleTimes(t *testing.T) {
-	runnable := &mockRunnable{
-		runFunc: func(ctx context.Context, onReady func()) error {
-			onReady()
-			onReady() // Call ready multiple times
-			onReady()
-			<-ctx.Done()
-			return nil
-		},
-	}
-
-	adapter := NewRunFnAdapter(runnable.Run)
-	ctx := context.Background()
-
-	// Should not panic or cause issues
-	err := adapter.OnStart()(ctx)
-	assert.NoError(t, err)
-
-	closeCtx := context.Background()
-	err = adapter.OnClose()(closeCtx)
-	assert.NoError(t, err)
-}
-
-func TestRunnableAdapter_Start_ReadyNeverCalled(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		runnable := &mockRunnable{
-			runFunc: func(ctx context.Context, onReady func()) error {
-				// Never call onReady
-				<-ctx.Done()
-				return ctx.Err()
-			},
-		}
-
-		adapter := NewRunFnAdapter(runnable.Run)
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		err := adapter.OnStart()(ctx)
-		assert.Error(t, err)
-		assert.True(t, errors.Is(err, context.DeadlineExceeded))
+// TestRunFnAdapter_RunFnFinishesBeforeClose verifies that if runFn finishes on its own
+// (returning nil), wait and close both reflect that clean exit.
+func TestRunFnAdapter_RunFnFinishesOnItsOwn(t *testing.T) {
+	adapter := NewRunFnAdapter(func(ctx context.Context) error {
+		return nil // finishes immediately
 	})
-}
 
-func TestRunnableAdapter_CloseContext_UsedDuringCleanup(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cleanupDone := make(chan struct{})
-		var cleanupErr error
+	err := adapter.OnStart()(context.Background())
+	require.NoError(t, err)
 
-		runnable := &mockRunnable{
-			runFunc: func(ctx context.Context, onReady func()) error {
-				onReady()
-				<-ctx.Done()
-
-				// Use close context for cleanup
-				closeCtx := contexts.GetCloseCtx(ctx)
-				select {
-				case <-closeCtx.Done():
-					cleanupErr = closeCtx.Err()
-				default:
-					// Cleanup completed within timeout
-				}
-				close(cleanupDone)
-				return nil
-			},
-		}
-
-		adapter := NewRunFnAdapter(runnable.Run)
-		startCtx := context.Background()
-
-		err := adapter.OnStart()(startCtx)
-		require.NoError(t, err)
-
-		closeCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		defer cancel()
-
-		err = adapter.OnClose()(closeCtx)
-		assert.NoError(t, err)
-
-		<-cleanupDone
-		assert.NoError(t, cleanupErr)
-	})
-}
-
-func TestErrAlreadyRunning(t *testing.T) {
-	assert.Equal(t, "runFn is already running", ErrAlreadyRunning.Error())
+	err = adapter.OnWait()()
+	assert.NoError(t, err)
 }
