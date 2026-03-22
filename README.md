@@ -1,3 +1,7 @@
+[![list](https://github.com/cardinalby/go-lccore/actions/workflows/list.yml/badge.svg)](https://github.com/cardinalby/go-lccore/actions/workflows/list.yml)
+[![test](https://github.com/cardinalby/go-lccore/actions/workflows/test.yml/badge.svg)](https://github.com/cardinalby/go-lccore/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cardinalby/go-lccore.svg)](https://pkg.go.dev/github.com/cardinalby/go-lccore)
+
 # go-lccore
 
 `go-lccore` is a Go library that provides the **core machinery for dependency-aware component lifecycle management**. It is intended as a building block for higher-level frameworks rather than as a direct application dependency — it handles graph construction, dependency-ordered hook execution, and observer callbacks, leaving the component model and configuration format entirely to the consumer.
